@@ -1,0 +1,339 @@
+// ============================================================
+// AI Business Operations Platform — Prisma Schema
+//
+// Design decisions (see README for full rationale):
+// - Every business-data table carries a `tenantId` FK to Tenant.
+//   This is the multi-tenant isolation boundary: every query in
+//   the app is required to filter by tenantId (enforced in
+//   lib/db.ts via a query wrapper, not just convention).
+// - RefreshToken is its own table (not a JWT claim) so tokens
+//   can be revoked/rotated server-side and reused-token theft
+//   can be detected (see lib/auth/tokens.ts).
+// - AuditLog is append-only and tenant-scoped, used both for the
+//   "Workflow Automation" requirement and for the Security
+//   requirement's audit trail.
+// - Conversation/Message model is shared by WhatsApp, Email and
+//   Call channels via a `channel` enum rather than 3 separate
+//   tables, so the Unified Inbox can query one table and the AI
+//   summary/sentiment fields live in one place.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------
+// Tenancy & Identity
+// ----------------------------
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // onboarding fields used as AI business-context
+  industry       String?
+  businessGoals  String?
+  productSummary String?
+  timezone       String  @default("Asia/Kolkata")
+
+  users         User[]
+  contacts      Contact[]
+  opportunities Opportunity[]
+  conversations Conversation[]
+  messages      Message[]
+  tasks         Task[]
+  auditLogs     AuditLog[]
+  chatSessions  ChatSession[]
+  refreshTokens RefreshToken[]
+
+  @@map("tenants")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  AGENT
+}
+
+model User {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  email     String
+  name      String?
+  avatarUrl String?
+  googleId  String?  @unique
+  role      Role     @default(OWNER)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refreshTokens RefreshToken[]
+  chatSessions  ChatSession[]
+  auditLogs     AuditLog[]
+  tasks         Task[]
+
+  // a single email may exist across tenants only once per tenant
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("users")
+}
+
+// One row per issued refresh token. Rotation: on each refresh,
+// the old row is marked `revokedAt` and `replacedById` points to
+// the new row, forming a chain we can use to detect reuse attacks
+// (if a revoked token is presented again, we kill the whole chain).
+model RefreshToken {
+  id           String    @id @default(cuid())
+  tenantId     String
+  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash    String    @unique // sha256 of the actual token, never store raw
+  family       String    // groups a rotation chain together
+  createdAt    DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?
+  userAgent    String?
+  ip           String?
+
+  @@index([userId])
+  @@index([family])
+  @@map("refresh_tokens")
+}
+
+// ----------------------------
+// CRM
+// ----------------------------
+
+enum OpportunityStage {
+  NEW
+  QUALIFIED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+model Contact {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name      String
+  phone     String?
+  email     String?
+  company   String?
+  tags      String[] @default([])
+  source    String? // e.g. "Meta Ads", "Referral", "Website"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  opportunities Opportunity[]
+  conversations Conversation[]
+  tasks         Task[]
+
+  @@index([tenantId])
+  @@index([tenantId, phone])
+  @@map("contacts")
+}
+
+model Opportunity {
+  id        String           @id @default(cuid())
+  tenantId  String
+  tenant    Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contactId String
+  contact   Contact          @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  title         String
+  stage         OpportunityStage @default(NEW)
+  value         Decimal          @default(0) @db.Decimal(12, 2)
+  aiScore       Int?             // 0-100 AI qualification score
+  nextBestAction String?         // AI-generated recommendation
+  nextBestActionReason String?   // explainability: why the AI suggested it
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tasks Task[]
+
+  @@index([tenantId])
+  @@index([tenantId, stage])
+  @@map("opportunities")
+}
+
+model Task {
+  id            String       @id @default(cuid())
+  tenantId      String
+  tenant        Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contactId     String?
+  contact       Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  opportunityId String?
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: SetNull)
+  assignedToId  String?
+  assignedTo    User?        @relation(fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  title       String
+  notes       String?
+  dueAt       DateTime?
+  completedAt DateTime?
+  createdByAI Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@map("tasks")
+}
+
+// ----------------------------
+// Unified Inbox
+// ----------------------------
+
+enum Channel {
+  WHATSAPP
+  EMAIL
+  CALL
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum Sentiment {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+model Conversation {
+  id        String  @id @default(cuid())
+  tenantId  String
+  tenant    Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contactId String
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  channel   Channel
+
+  // AI-derived fields, refreshed after each inbound message
+  aiSummary           String?
+  intent               String?
+  sentiment             Sentiment?
+  recommendedNextAction String?
+  urgency               String? // e.g. "24h", "48h", "low"
+
+  externalThreadId String? // e.g. WhatsApp wa_id, email Message-ID root
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages Message[]
+
+  @@index([tenantId])
+  @@index([tenantId, channel])
+  @@map("conversations")
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  tenantId       String
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  channel   Channel
+  direction MessageDirection
+  body      String
+  aiGenerated Boolean @default(false)
+
+  externalId String? // WhatsApp message id / email Message-ID / call recording id
+  metadata   Json?   // raw webhook payload, call duration, etc.
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([conversationId])
+  @@map("messages")
+}
+
+// ----------------------------
+// AI Agent
+// ----------------------------
+
+model ChatSession {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages ChatMessage[]
+
+  @@index([tenantId])
+  @@map("chat_sessions")
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+  TOOL
+}
+
+model ChatMessage {
+  id        String      @id @default(cuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  role        ChatRole
+  content     String
+  toolName    String?  // set when role = TOOL
+  toolArgs    Json?
+  toolResult  Json?
+  reasoning   String?  // short explainability note shown to the user
+
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+  @@map("chat_messages")
+}
+
+// ----------------------------
+// Audit
+// ----------------------------
+
+model AuditLog {
+  id       String  @id @default(cuid())
+  tenantId String
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String?
+  user     User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action     String // e.g. "ai.tool.send_whatsapp", "auth.login", "opportunity.update"
+  entityType String? // e.g. "Opportunity"
+  entityId   String?
+  metadata   Json?
+  ip         String?
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, action])
+  @@map("audit_logs")
+}
