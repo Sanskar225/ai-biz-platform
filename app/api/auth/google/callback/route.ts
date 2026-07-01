@@ -13,8 +13,10 @@ export async function GET(req: NextRequest) {
   const store = await cookies();
   const expectedState = store.get("oauth_state")?.value;
   const verifier = store.get("oauth_verifier")?.value;
+  const next = store.get("oauth_next")?.value;
   store.delete("oauth_state");
   store.delete("oauth_verifier");
+  store.delete("oauth_next");
 
   if (!code || !state || !verifier || state !== expectedState) {
     return NextResponse.redirect(new URL("/login?error=invalid_state", req.url));
@@ -27,6 +29,7 @@ export async function GET(req: NextRequest) {
   // create their tenant (business) before they can use the app — this
   // is the "Business Onboarding" requirement.
   let user = await prisma.user.findUnique({ where: { googleId: profile.sub } });
+  let isNewUser = false;
 
   if (!user) {
     // Create a personal tenant placeholder; onboarding will rename/fill it.
@@ -46,6 +49,7 @@ export async function GET(req: NextRequest) {
         role: "OWNER",
       },
     });
+    isNewUser = true;
     await writeAuditLog({ tenantId: tenant.id, userId: user.id, action: "auth.signup", ip: req.headers.get("x-forwarded-for") ?? undefined });
   } else {
     await writeAuditLog({ tenantId: user.tenantId, userId: user.id, action: "auth.login", ip: req.headers.get("x-forwarded-for") ?? undefined });
@@ -61,6 +65,6 @@ export async function GET(req: NextRequest) {
 
   await setAuthCookies(accessToken, refreshToken);
 
-  const dest = user.role === "OWNER" ? "/dashboard" : "/dashboard";
+  const dest = isNewUser ? "/onboarding" : next && next.startsWith("/") ? next : "/dashboard";
   return NextResponse.redirect(new URL(dest, req.url));
 }

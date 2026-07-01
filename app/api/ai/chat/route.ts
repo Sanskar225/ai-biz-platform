@@ -27,29 +27,53 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const MAX_STEPS = 5;
 
 export async function POST(req: NextRequest) {
-  const auth = await getAuthContext(); // throws 401 if not logged in (caught by Next's error boundary -> handled below)
-  const { sessionId: incomingSessionId, message } = await req.json();
+  let auth;
+  let tenant;
+  let session;
+  let history;
+  let message: string;
 
-  const tenant = await prisma.tenant.findUniqueOrThrow({ where: { id: auth.tenantId } });
+  try {
+    auth = await getAuthContext(); // throws UnauthorizedError if no/invalid/expired access_token cookie
+    const body = await req.json();
+    message = body.message;
+    const incomingSessionId = body.sessionId;
 
-  let session = incomingSessionId
-    ? await prisma.chatSession.findFirst({ where: { id: incomingSessionId, tenantId: auth.tenantId } })
-    : null;
-  if (!session) {
-    session = await prisma.chatSession.create({
-      data: { tenantId: auth.tenantId, userId: auth.sub, title: message.slice(0, 60) },
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return new Response(JSON.stringify({ error: "message is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+
+    tenant = await prisma.tenant.findUniqueOrThrow({ where: { id: auth.tenantId } });
+
+    session = incomingSessionId
+      ? await prisma.chatSession.findFirst({ where: { id: incomingSessionId, tenantId: auth.tenantId } })
+      : null;
+    if (!session) {
+      session = await prisma.chatSession.create({
+        data: { tenantId: auth.tenantId, userId: auth.sub, title: message.slice(0, 60) },
+      });
+    }
+
+    await prisma.chatMessage.create({
+      data: { sessionId: session.id, role: "USER", content: message },
     });
+
+    history = await prisma.chatMessage.findMany({
+      where: { sessionId: session.id },
+      orderBy: { createdAt: "asc" },
+      take: 30,
+    });
+  } catch (err) {
+    // UnauthorizedError -> 401 so the client's apiFetch wrapper knows to
+    // refresh the token and retry; anything else -> 500 with a real
+    // message instead of Next's generic HTML error page, which is what
+    // a raw, uncaught throw here would otherwise produce.
+    const isAuthError = err instanceof Error && err.name === "UnauthorizedError";
+    const status = isAuthError ? 401 : 500;
+    const message_ = err instanceof Error ? err.message : "Failed to start chat session";
+    console.error("AI chat setup error:", err);
+    return new Response(JSON.stringify({ error: message_ }), { status, headers: { "Content-Type": "application/json" } });
   }
-
-  await prisma.chatMessage.create({
-    data: { sessionId: session.id, role: "USER", content: message },
-  });
-
-  const history = await prisma.chatMessage.findMany({
-    where: { sessionId: session.id },
-    orderBy: { createdAt: "asc" },
-    take: 30,
-  });
 
   const systemInstruction = `You are the AI business assistant for "${tenant.name}" (industry: ${tenant.industry ?? "unspecified"}).
 You can search contacts, create tasks, update opportunities, send WhatsApp messages, and fetch live business metrics using the available tools.

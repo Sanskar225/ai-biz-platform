@@ -1,6 +1,7 @@
 "use client";
 import { useRef, useState } from "react";
 import { SideNav } from "@/components/SideNav";
+import { apiFetch } from "@/lib/apiFetch";
 
 interface ToolCallEvent {
   name: string;
@@ -20,6 +21,7 @@ export default function AgentPage() {
   const [input, setInput] = useState("");
   const [sessionId, setSessionId] = useState<string | undefined>();
   const [streaming, setStreaming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   async function send() {
@@ -27,15 +29,37 @@ export default function AgentPage() {
     const userText = input;
     setInput("");
     setStreaming(true);
+    setError(null);
     setTurns((t) => [...t, { role: "user", text: userText }, { role: "assistant", text: "", toolCalls: [] }]);
 
-    const res = await fetch("/api/ai/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, message: userText }),
-    });
+    let res: Response;
+    try {
+      res = await apiFetch("/api/ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, message: userText }),
+      });
+    } catch (e) {
+      setError("Couldn't reach the server — check that the dev server is running and DATABASE_URL/GEMINI_API_KEY are set.");
+      setStreaming(false);
+      return;
+    }
+
+    if (!res.ok) {
+      let detail = `Request failed (${res.status})`;
+      try {
+        const body = await res.json();
+        if (body?.error) detail = body.error;
+      } catch {
+        /* response wasn't JSON, fall back to the status code message above */
+      }
+      setError(detail);
+      setStreaming(false);
+      return;
+    }
 
     if (!res.body) {
+      setError("No response stream from the server.");
       setStreaming(false);
       return;
     }
@@ -44,32 +68,41 @@ export default function AgentPage() {
     const decoder = new TextDecoder();
     let buffer = "";
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
 
-      const events = buffer.split("\n\n");
-      buffer = events.pop() ?? "";
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
 
-      for (const ev of events) {
-        if (!ev.startsWith("data: ")) continue;
-        const payload = JSON.parse(ev.slice(6));
+        for (const ev of events) {
+          if (!ev.startsWith("data: ")) continue;
+          const payload = JSON.parse(ev.slice(6));
 
-        setTurns((prev) => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (payload.type === "token") {
-            last.text += payload.text;
-          } else if (payload.type === "tool_call") {
-            last.toolCalls = [...(last.toolCalls ?? []), payload];
-          } else if (payload.type === "done") {
-            setSessionId(payload.sessionId);
+          if (payload.type === "error") {
+            setError(payload.message ?? "The AI agent hit an error.");
+            continue;
           }
-          return next;
-        });
-        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+
+          setTurns((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (payload.type === "token") {
+              last.text += payload.text;
+            } else if (payload.type === "tool_call") {
+              last.toolCalls = [...(last.toolCalls ?? []), payload];
+            } else if (payload.type === "done") {
+              setSessionId(payload.sessionId);
+            }
+            return next;
+          });
+          bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+        }
       }
+    } catch (e) {
+      setError("Lost connection while streaming the response.");
     }
     setStreaming(false);
   }
@@ -112,9 +145,12 @@ export default function AgentPage() {
           placeholder="Ask your AI employee anything…"
         />
         <button onClick={send} disabled={streaming} className="rounded-lg bg-white px-4 py-2 text-sm font-medium text-neutral-900 disabled:opacity-50">
-          Send
+          {streaming ? "Thinking…" : "Send"}
         </button>
       </div>
+      {error && (
+        <p className="mt-2 rounded-lg border border-red-900/40 bg-red-950/30 px-3 py-2 text-xs text-red-300">{error}</p>
+      )}
     </main>
     </div>
   );
